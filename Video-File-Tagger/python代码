@@ -1,0 +1,775 @@
+import os
+import wx
+import wx.lib.buttons as buttons
+import sqlite3
+import cv2
+from PIL import Image
+import sys
+import subprocess
+import shutil
+import webbrowser
+from collections import OrderedDict
+# ========== 窗口和组件尺寸/位置配置 ==========
+MAIN_WINDOW_SIZE = (1910, 1000)  # 主窗口尺寸(宽度,高度)
+TOOLBAR_POS = (10, 10)           # 工具栏位置(左上角x坐标,y坐标)
+TOOLBAR_SIZE = (1660, 75)        # 工具栏尺寸(宽度,高度)
+
+VIDEO_LIST_POS = (10, 60)        # 视频列表位置(左上角x坐标,y坐标)
+VIDEO_LIST_SIZE = (400, 800)     # 视频列表尺寸(宽度,高度)
+
+size = 38                        # 基础尺寸单位(用于计算预览区相关尺寸)
+PREVIEW_POS = (420, 60)          # 视频预览区位置(左上角x坐标,y坐标)
+PREVIEW_SIZE = (16*size, 9*size) # 视频预览区尺寸(16:9比例，基于size计算)
+THUMBNAIL_SIZE = (16*size, 9*size) # 缩略图尺寸(与预览区相同)
+
+TAG_BUTTONS_POS = (1050, 120)    # 标签按钮区位置(左上角x坐标,y坐标)
+TAG_BUTTONS_SIZE = (820, 800)    # 标签按钮区尺寸(宽度,高度)
+TAG_BUTTON_SIZE = (120, 30)      # 单个标签按钮尺寸(宽度,高度)
+
+CURRENT_TAGS_POS = (420, 410)    # 当前文件标签区位置(左上角x坐标,y坐标)
+CURRENT_TAGS_SIZE = (610, 430)   # 当前文件标签区尺寸(宽度,高度)
+
+ADD_TAG_POS = (420, 860)         # 添加标签区位置(左上角x坐标,y坐标)
+ADD_TAG_SIZE = (600, 40)         # 添加标签区尺寸(宽度,高度)
+
+
+
+class VideoTagger(wx.Frame):
+    def __init__(self):
+        super().__init__(None, title="文件标签管理系统", size=MAIN_WINDOW_SIZE)
+        self.selected_tags = OrderedDict()  # 使用OrderedDict保持标签选择顺序
+        self.current_video_id = None
+        self.is_txt_file = False
+        self.default_txt_icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edge.jpg")
+
+        self.init_db()
+        self.create_absolute_layout_ui()
+        self.Centre()
+        self.Show()
+        self.auto_browse_video_folder()
+
+    def auto_browse_video_folder(self):
+        video_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "video")
+        if os.path.exists(video_folder):
+            self.dir_picker.SetPath(video_folder)
+            self.on_scan(None)
+
+    def init_db(self):
+        self.conn = sqlite3.connect('video_tags.db')
+        self.cursor = self.conn.cursor()
+
+        self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='videos'")
+        if not self.cursor.fetchone():
+            self.cursor.execute('''CREATE TABLE videos
+                                (id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT, thumbnail TEXT,
+                                is_txt INTEGER DEFAULT 0, url TEXT, is_deleted INTEGER DEFAULT 0)''')
+            self.cursor.execute('''CREATE TABLE tags
+                                (id INTEGER PRIMARY KEY, video_id INTEGER, tag TEXT,
+                                FOREIGN KEY(video_id) REFERENCES videos(id))''')
+            self.conn.commit()
+        else:
+            self.cursor.execute("PRAGMA table_info(videos)")
+            columns = [column[1] for column in self.cursor.fetchall()]
+            if 'is_txt' not in columns:
+                self.cursor.execute("ALTER TABLE videos ADD COLUMN is_txt INTEGER DEFAULT 0")
+            if 'url' not in columns:
+                self.cursor.execute("ALTER TABLE videos ADD COLUMN url TEXT")
+            if 'is_deleted' not in columns:
+                self.cursor.execute("ALTER TABLE videos ADD COLUMN is_deleted INTEGER DEFAULT 0")
+            self.conn.commit()
+
+    def create_absolute_layout_ui(self):
+        panel = wx.Panel(self)
+        panel.SetBackgroundColour(wx.Colour(240, 240, 240))
+
+        # 工具栏
+        toolbar = wx.Panel(panel, pos=TOOLBAR_POS, size=TOOLBAR_SIZE)
+        toolbar.SetBackgroundColour(wx.Colour(240, 240, 240))
+        self.dir_picker = wx.DirPickerCtrl(toolbar, pos=(0, 0), size=(600, -1), style=wx.DIRP_USE_TEXTCTRL)
+        self.scan_btn = wx.Button(toolbar, label="扫描文件夹", pos=(610, 0), size=(120, -1))
+        self.import_btn = wx.Button(toolbar, label="导入文件", pos=(740, 0), size=(120, -1))
+        self.search_input = wx.SearchCtrl(toolbar, pos=(1040, 50), size=(600, -1), style=wx.TE_PROCESS_ENTER)
+        self.search_input.SetDescriptiveText("输入标签关键词...")
+
+        # 文件列表
+        self.video_list = wx.ListCtrl(panel, pos=VIDEO_LIST_POS, size=VIDEO_LIST_SIZE,
+                                    style=wx.LC_REPORT|wx.LC_SINGLE_SEL|wx.BORDER_SUNKEN)
+        self.video_list.InsertColumn(0, "文件名称", width=VIDEO_LIST_SIZE[0]-20)
+
+        # 文件预览区
+        preview_panel = wx.Panel(panel, pos=PREVIEW_POS, size=PREVIEW_SIZE)
+        preview_panel.SetBackgroundColour(wx.WHITE)
+        self.thumbnail = wx.StaticBitmap(preview_panel, pos=((PREVIEW_SIZE[0] - THUMBNAIL_SIZE[0]) // 2, 0), size=THUMBNAIL_SIZE)
+        self.thumbnail.Bind(wx.EVT_LEFT_DCLICK, self.on_thumbnail_click)
+        self.video_name = wx.StaticText(preview_panel, pos=(0, THUMBNAIL_SIZE[1]), size=(PREVIEW_SIZE[0], 20), style=wx.ALIGN_CENTER)
+        self.video_name.SetFont(wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+
+        # 标签按钮区
+        self.tags_panel = wx.ScrolledWindow(panel, pos=TAG_BUTTONS_POS, size=TAG_BUTTONS_SIZE, style=wx.BORDER_SUNKEN)
+        self.tags_panel.SetBackgroundColour(wx.WHITE)
+        self.tags_panel.SetScrollRate(10, 10)
+        self.tag_buttons = {}
+
+        # 当前文件标签区
+        self.current_video_tags_panel = wx.ScrolledWindow(panel, pos=CURRENT_TAGS_POS, size=CURRENT_TAGS_SIZE, style=wx.BORDER_SUNKEN)
+        self.current_video_tags_panel.SetBackgroundColour(wx.WHITE)
+        self.current_video_tags_panel.SetScrollRate(10, 10)
+
+        # 添加标签区（包含删除按钮）
+        add_tag_panel = wx.Panel(panel, pos=ADD_TAG_POS, size=ADD_TAG_SIZE)
+        add_tag_panel.SetBackgroundColour(wx.Colour(240, 240, 240))
+
+        wx.StaticText(add_tag_panel, label="添加标签:", pos=(10,12))
+        self.tag_input = wx.TextCtrl(add_tag_panel, pos=(80,5), size=(350,-1), style=wx.TE_PROCESS_ENTER)
+        self.add_tag_btn = wx.Button(add_tag_panel, label="添加", pos=(436,5), size=(80,-1))
+
+        # 删除按钮
+        self.delete_btn = wx.Button(add_tag_panel, label="删除文件", pos=(520,5), size=(80,-1))
+        self.delete_btn.SetBackgroundColour(wx.Colour(255, 150, 150))
+        self.delete_btn.SetToolTip("从系统中移除该文件（不会删除实际文件)")
+
+        self.refresh_tag_buttons()
+        self.bind_events()
+        self.load_all_videos()
+
+    def bind_events(self):
+        self.scan_btn.Bind(wx.EVT_BUTTON, self.on_scan)
+        self.import_btn.Bind(wx.EVT_BUTTON, self.on_import)
+        self.video_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_video_select)
+        self.add_tag_btn.Bind(wx.EVT_BUTTON, self.on_add_tag)
+        self.delete_btn.Bind(wx.EVT_BUTTON, self.on_delete_file)
+        self.tag_input.Bind(wx.EVT_TEXT_ENTER, self.on_add_tag)
+        self.search_input.Bind(wx.EVT_TEXT, self.on_search_input_changed)
+        self.search_input.Bind(wx.EVT_SEARCHCTRL_CANCEL_BTN, self.on_clear_search)
+
+    def load_image_from_file(self, path):
+        try:
+            if not os.path.exists(path):
+                return None
+            img = wx.Image(path, wx.BITMAP_TYPE_ANY)
+            img.Rescale(THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1])
+            return wx.Bitmap(img)
+        except Exception as e:
+            print(f"加载图像错误: {str(e)}")
+            return None
+
+    def on_thumbnail_click(self, event):
+        if self.current_video_id is None:
+            return
+
+        self.cursor.execute("SELECT path, is_txt, url FROM videos WHERE id=?", (self.current_video_id,))
+        path, is_txt, url = self.cursor.fetchone()
+
+        if is_txt:
+            if url:
+                try:
+                    webbrowser.open(url)
+                except Exception as e:
+                    wx.MessageBox(f"无法打开网址: {str(e)}", "错误", wx.OK|wx.ICON_ERROR)
+        else:
+            try:
+                if sys.platform == 'win32':
+                    os.startfile(path)
+                elif sys.platform == 'darwin':
+                    subprocess.call(['open', path])
+                else:
+                    subprocess.call(['xdg-open', path])
+            except Exception as e:
+                wx.MessageBox(f"无法打开文件: {str(e)}", "错误", wx.OK|wx.ICON_ERROR)
+
+    def on_video_select(self, event):
+        selected = self.video_list.GetFirstSelected()
+        if selected == -1:
+            return
+
+        video_id = self.video_list.GetItemData(selected)
+        self.current_video_id = video_id
+
+        self.cursor.execute("SELECT name, thumbnail, is_txt, url FROM videos WHERE id=?", (video_id,))
+        name, thumb_path, is_txt, url = self.cursor.fetchone()
+
+        self.is_txt_file = is_txt == 1
+        self.video_name.SetLabel(name)
+
+        if is_txt:
+            if os.path.exists(self.default_txt_icon):
+                bitmap = self.load_image_from_file(self.default_txt_icon)
+                if bitmap:
+                    self.thumbnail.SetBitmap(bitmap)
+        else:
+            if thumb_path and os.path.exists(thumb_path):
+                bitmap = self.load_image_from_file(thumb_path)
+                if bitmap:
+                    self.thumbnail.SetBitmap(bitmap)
+                else:
+                    self.generate_thumbnail_for_video(video_id)
+            else:
+                self.generate_thumbnail_for_video(video_id)
+
+        self.refresh_current_video_tags(video_id)
+
+    def generate_thumbnail_for_video(self, video_id):
+        self.cursor.execute("SELECT path FROM videos WHERE id=?", (video_id,))
+        video_path = self.cursor.fetchone()[0]
+
+        thumb_dir = os.path.join(os.path.dirname(video_path), '.thumbnails')
+        if not os.path.exists(thumb_dir):
+            os.makedirs(thumb_dir)
+
+        thumb_path = os.path.join(thumb_dir, f"{os.path.splitext(os.path.basename(video_path))[0]}.jpg")
+
+        if self.generate_thumbnail(video_path, thumb_path):
+            self.cursor.execute("UPDATE videos SET thumbnail=? WHERE id=?", (thumb_path, video_id))
+            self.conn.commit()
+            bitmap = self.load_image_from_file(thumb_path)
+            if bitmap:
+                self.thumbnail.SetBitmap(bitmap)
+
+    def on_scan(self, event):
+        folder = self.dir_picker.GetPath()
+        if not folder:
+            wx.MessageBox("请先选择文件夹", "错误", wx.OK|wx.ICON_ERROR)
+            return
+
+        self.video_list.DeleteAllItems()
+        video_exts = ('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')
+        txt_ext = '.txt'
+        thumb_dir = os.path.join(folder, '.thumbnails')
+
+        if not os.path.exists(thumb_dir):
+            os.makedirs(thumb_dir)
+
+        for root, dirs, files in os.walk(folder):
+            for file in files:
+                file_lower = file.lower()
+                if file_lower.endswith(video_exts) or file_lower.endswith(txt_ext):
+                    path = os.path.join(root, file)
+                    name = os.path.splitext(file)[0]
+                    is_txt = file_lower.endswith(txt_ext)
+
+                    rel_path = os.path.relpath(root, folder)
+                    folder_tags = []
+                    if rel_path != '.':
+                        folder_tags = [part for part in rel_path.split(os.sep) if part]
+
+                    self.cursor.execute("SELECT id, is_deleted FROM videos WHERE path=?", (path,))
+                    result = self.cursor.fetchone()
+
+                    if not result:
+                        if is_txt:
+                            try:
+                                with open(path, 'r', encoding='utf-8') as f:
+                                    url = f.read().strip()
+                            except Exception as e:
+                                print(f"读取TXT文件错误: {str(e)}")
+                                url = ""
+
+                            self.cursor.execute(
+                                "INSERT INTO videos (path, name, is_txt, url) VALUES (?, ?, ?, ?)",
+                                (path, name, 1, url)
+                            )
+                            self.conn.commit()
+                            video_id = self.cursor.lastrowid
+
+                            self.cursor.execute(
+                                "INSERT INTO tags (video_id, tag) VALUES (?, ?)",
+                                (video_id, "网页")
+                            )
+                        else:
+                            thumb_path = os.path.join(thumb_dir, f"{name}.jpg")
+                            self.generate_thumbnail(path, thumb_path)
+
+                            self.cursor.execute(
+                                "INSERT INTO videos (path, name, thumbnail) VALUES (?, ?, ?)",
+                                (path, name, thumb_path)
+                            )
+                            self.conn.commit()
+                            video_id = self.cursor.lastrowid
+
+                        for tag in folder_tags:
+                            self.cursor.execute(
+                                "INSERT INTO tags (video_id, tag) VALUES (?, ?)",
+                                (video_id, tag)
+                            )
+                        self.conn.commit()
+
+                        if not result or result[1] == 0:
+                            index = self.video_list.InsertItem(self.video_list.GetItemCount(), name)
+                            self.video_list.SetItemData(index, video_id)
+                    else:
+                        video_id, is_deleted = result
+                        for tag in folder_tags:
+                            self.cursor.execute(
+                                "SELECT id FROM tags WHERE video_id=? AND tag=?",
+                                (video_id, tag)
+                            )
+                            if not self.cursor.fetchone():
+                                self.cursor.execute(
+                                    "INSERT INTO tags (video_id, tag) VALUES (?, ?)",
+                                    (video_id, tag)
+                                )
+                        self.conn.commit()
+
+                        if is_deleted == 0:
+                            index = self.video_list.InsertItem(self.video_list.GetItemCount(), name)
+                            self.video_list.SetItemData(index, video_id)
+
+        self.refresh_tag_buttons()
+
+    def on_import(self, event):
+        wildcard = "所有文件 (*.*)|*.*"
+        dialog = wx.FileDialog(self, "选择要导入的文件", wildcard=wildcard,
+                             style=wx.FD_OPEN|wx.FD_FILE_MUST_EXIST|wx.FD_MULTIPLE)
+
+        if dialog.ShowModal() == wx.ID_OK:
+            paths = dialog.GetPaths()
+            folder = self.dir_picker.GetPath()
+            if not folder:
+                wx.MessageBox("请先选择目标文件夹", "错误", wx.OK|wx.ICON_ERROR)
+                dialog.Destroy()
+                return
+
+            thumb_dir = os.path.join(folder, '.thumbnails')
+            if not os.path.exists(thumb_dir):
+                os.makedirs(thumb_dir)
+
+            for path in paths:
+                try:
+                    dest_path = os.path.join(folder, os.path.basename(path))
+                    if not os.path.exists(dest_path):
+                        shutil.copy2(path, dest_path)
+
+                    name = os.path.splitext(os.path.basename(path))[0]
+                    is_txt = path.lower().endswith('.txt')
+
+                    self.cursor.execute("SELECT id, is_deleted FROM videos WHERE path=?", (dest_path,))
+                    result = self.cursor.fetchone()
+
+                    if not result:
+                        if is_txt:
+                            try:
+                                with open(dest_path, 'r', encoding='utf-8') as f:
+                                    url = f.read().strip()
+                            except Exception as e:
+                                print(f"读取TXT文件错误: {str(e)}")
+                                url = ""
+
+                            self.cursor.execute(
+                                "INSERT INTO videos (path, name, is_txt, url) VALUES (?, ?, ?, ?)",
+                                (dest_path, name, 1, url)
+                            )
+                            self.conn.commit()
+                            video_id = self.cursor.lastrowid
+
+                            self.cursor.execute(
+                                "INSERT INTO tags (video_id, tag) VALUES (?, ?)",
+                                (video_id, "网页")
+                            )
+                        else:
+                            thumb_path = os.path.join(thumb_dir, f"{name}.jpg")
+                            self.generate_thumbnail(dest_path, thumb_path)
+
+                            self.cursor.execute(
+                                "INSERT INTO videos (path, name, thumbnail) VALUES (?, ?, ?)",
+                                (dest_path, name, thumb_path)
+                            )
+                            self.conn.commit()
+                            video_id = self.cursor.lastrowid
+
+                        index = self.video_list.InsertItem(self.video_list.GetItemCount(), name)
+                        self.video_list.SetItemData(index, video_id)
+                        self.video_list.Select(index)
+                        self.video_list.Focus(index)
+                        self.current_video_id = video_id
+                        self.refresh_current_video_tags(video_id)
+                        self.tag_input.SetValue("")
+                        self.tag_input.SetFocus()
+                    else:
+                        video_id, is_deleted = result
+                        if is_deleted == 1:
+                            self.cursor.execute("UPDATE videos SET is_deleted=0 WHERE id=?", (video_id,))
+                            self.conn.commit()
+
+                            index = self.video_list.InsertItem(self.video_list.GetItemCount(), name)
+                            self.video_list.SetItemData(index, video_id)
+                            self.video_list.Select(index)
+                            self.video_list.Focus(index)
+                            self.current_video_id = video_id
+                            self.refresh_current_video_tags(video_id)
+                            self.tag_input.SetValue("")
+                            self.tag_input.SetFocus()
+
+                except Exception as e:
+                    wx.MessageBox(f"导入文件 {os.path.basename(path)} 失败: {str(e)}", "错误", wx.OK|wx.ICON_ERROR)
+
+        dialog.Destroy()
+
+    def generate_thumbnail(self, video_path, thumb_path):
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                print(f"无法打开视频文件: {video_path}")
+                return False
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0:
+                fps = 30
+
+            target_frame = int(15 * fps)
+            cap.set(cv2.CAP_PROP_POS_Frames, target_frame)
+
+            success, frame = cap.read()
+            if not success:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                success, frame = cap.read()
+                if not success:
+                    return False
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame)
+            img.thumbnail(THUMBNAIL_SIZE)
+            img.save(thumb_path)
+            return True
+        except Exception as e:
+            print(f"生成缩略图错误: {str(e)}")
+            return False
+        finally:
+            if 'cap' in locals():
+                cap.release()
+
+    def refresh_current_video_tags(self, video_id):
+        self.current_video_tags_panel.DestroyChildren()
+
+        if video_id:  # 确保有选中的视频
+            self.cursor.execute("SELECT name, is_txt, url FROM videos WHERE id=?", (video_id,))
+            name, is_txt, url = self.cursor.fetchone()
+
+            # 文件名编辑区域
+            rename_panel = wx.Panel(self.current_video_tags_panel, pos=(10, 10), size=(600, 40))
+            wx.StaticText(rename_panel, label="文件名:", pos=(0, 10))
+            self.name_edit = wx.TextCtrl(rename_panel, value=name, pos=(60, 5), size=(400, -1), style=wx.TE_PROCESS_ENTER)
+            self.name_edit.Bind(wx.EVT_TEXT_ENTER, self.on_rename_file)
+            rename_btn = wx.Button(rename_panel, label="修改", pos=(470, 5), size=(80, -1))
+            rename_btn.Bind(wx.EVT_BUTTON, self.on_rename_file)
+
+            y = 60  # 起始Y坐标
+
+            if is_txt:
+                # 网址编辑区域 - 放在文件名下方
+                url_panel = wx.Panel(self.current_video_tags_panel, pos=(10, y), size=(600, 40))
+                wx.StaticText(url_panel, label="网址:", pos=(0, 6))
+                self.url_edit = wx.TextCtrl(url_panel, value=url or "", pos=(60, 0), size=(400, -1), style=wx.TE_PROCESS_ENTER)
+                self.url_edit.Bind(wx.EVT_TEXT_ENTER, self.on_update_url)
+                update_url_btn = wx.Button(url_panel, label="更新", pos=(470, 5), size=(80, -1))
+                update_url_btn.Bind(wx.EVT_BUTTON, self.on_update_url)
+                y += 50  # 增加Y坐标
+            else:
+                # 确保URL编辑控件不存在
+                if hasattr(self, 'url_edit'):
+                    self.url_edit = None
+
+            # 标签区域
+            self.cursor.execute("SELECT id, tag FROM tags WHERE video_id=? ORDER BY id", (video_id,))
+            tags = self.cursor.fetchall()
+
+            x = 10
+            for tag_id, tag in tags:
+                tag_panel = wx.Panel(self.current_video_tags_panel, pos=(x, y), size=(200, 30))
+
+                tag_text = wx.TextCtrl(tag_panel, value=tag, pos=(5, 5), size=(100, -1), style=wx.TE_PROCESS_ENTER)
+                tag_text.Bind(wx.EVT_TEXT_ENTER, lambda e, t=tag_id, ctrl=tag_text: self.on_rename_tag(e, t, ctrl))
+
+                del_btn = wx.Button(tag_panel, label="×", pos=(120, 0), size=(30, 30))
+                del_btn.SetBackgroundColour(wx.Colour(255, 100, 100))
+                del_btn.Bind(wx.EVT_BUTTON, lambda e, t=tag_id: self.on_delete_tag(e, t))
+
+                rename_btn = wx.Button(tag_panel, label="✎", pos=(155, 0), size=(30, 30))
+                rename_btn.SetBackgroundColour(wx.Colour(180, 180, 255))
+                rename_btn.Bind(wx.EVT_BUTTON, lambda e, t=tag_id, ctrl=tag_text: self.on_rename_tag(e, t, ctrl))
+
+                x += 200
+                if x > CURRENT_TAGS_SIZE[0] - 200:
+                    x = 10
+                    y += 40
+
+            self.current_video_tags_panel.SetVirtualSize((CURRENT_TAGS_SIZE[0], y + 50))
+            self.current_video_tags_panel.Layout()
+    def on_update_url(self, event):
+        if not self.is_txt_file or self.current_video_id is None:
+            return
+
+        new_url = self.url_edit.GetValue().strip()
+        self.cursor.execute("UPDATE videos SET url=? WHERE id=?", (new_url, self.current_video_id))
+        self.conn.commit()
+
+        self.cursor.execute("SELECT path FROM videos WHERE id=?", (self.current_video_id,))
+        path = self.cursor.fetchone()[0]
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(new_url)
+        except Exception as e:
+            wx.MessageBox(f"更新TXT文件失败: {str(e)}", "错误", wx.OK|wx.ICON_ERROR)
+
+    def on_rename_tag(self, event, tag_id, ctrl):
+        new_tag = ctrl.GetValue().strip()
+        if not new_tag:
+            return
+
+        self.cursor.execute("UPDATE tags SET tag=? WHERE id=?", (new_tag, tag_id))
+        self.conn.commit()
+        self.refresh_tag_buttons()
+
+    def on_rename_file(self, event):
+        if self.current_video_id is None:
+            return
+
+        new_name = self.name_edit.GetValue().strip()
+        if not new_name:
+            return
+
+        self.cursor.execute("UPDATE videos SET name=? WHERE id=?", (new_name, self.current_video_id))
+        self.conn.commit()
+
+        selected = self.video_list.GetFirstSelected()
+        if selected != -1:
+            self.video_list.SetItemText(selected, new_name)
+
+        self.video_name.SetLabel(new_name)
+
+    def on_delete_tag(self, event, tag_id):
+        if self.current_video_id is None:
+            return
+
+        self.cursor.execute("DELETE FROM tags WHERE id=?", (tag_id,))
+        self.conn.commit()
+
+        self.refresh_current_video_tags(self.current_video_id)
+        self.refresh_tag_buttons()
+
+    def on_delete_file(self, event):
+        if self.current_video_id is None:
+            wx.MessageBox("请先选择要删除的文件", "错误", wx.OK|wx.ICON_ERROR)
+            return
+
+        confirm = wx.MessageDialog(self,
+                                 "确定要从系统中删除此文件吗？\n(不会删除实际文件)",
+                                 "确认删除",
+                                 wx.YES_NO|wx.ICON_QUESTION)
+
+        if confirm.ShowModal() == wx.ID_YES:
+            try:
+                self.cursor.execute("UPDATE videos SET is_deleted=1 WHERE id=?", (self.current_video_id,))
+                self.conn.commit()
+
+                selected = self.video_list.GetFirstSelected()
+                if selected != -1:
+                    self.video_list.DeleteItem(selected)
+
+                self.current_video_id = None
+                self.thumbnail.SetBitmap(wx.NullBitmap)
+                self.video_name.SetLabel("")
+                self.current_video_tags_panel.DestroyChildren()
+
+            except Exception as e:
+                wx.MessageBox(f"删除文件失败: {str(e)}", "错误", wx.OK|wx.ICON_ERROR)
+        confirm.Destroy()
+
+    def refresh_tag_buttons(self):
+        self.tags_panel.DestroyChildren()
+        self.tag_buttons = {}
+
+        # 获取当前选中的标签（保持选择顺序）
+        selected_tags = list(self.selected_tags.keys())
+
+        # 获取已选标签对应的视频数量
+        selected_videos_count = 0
+        if selected_tags:
+            query = '''
+            SELECT COUNT(DISTINCT v.id)
+            FROM videos v
+            WHERE v.is_deleted=0 AND EXISTS (
+                SELECT 1 FROM tags t
+                WHERE t.video_id = v.id AND t.tag = ?
+            )''' + (' AND EXISTS (SELECT 1 FROM tags t WHERE t.video_id = v.id AND t.tag = ?)' * (len(selected_tags)-1))
+
+            self.cursor.execute(query, selected_tags)
+            selected_videos_count = self.cursor.fetchone()[0]
+
+        # 构建查询条件
+        if selected_tags:
+            # 查询与已选标签共同出现的其他标签及其视频数量
+            query = '''
+            SELECT t2.tag, COUNT(DISTINCT t2.video_id) as video_count
+            FROM tags t1
+            JOIN tags t2 ON t1.video_id = t2.video_id
+            JOIN videos v ON t2.video_id = v.id
+            WHERE v.is_deleted = 0 AND t1.tag = ?
+            '''
+
+            if len(selected_tags) > 1:
+                query += ' AND ' + ' AND '.join(['EXISTS (SELECT 1 FROM tags t WHERE t.video_id = v.id AND t.tag = ?)' for _ in selected_tags[1:]])
+
+            query += '''
+            AND t2.tag NOT IN (%s)
+            GROUP BY t2.tag
+            ORDER BY video_count DESC, t2.tag
+            ''' % (','.join(['?']*len(selected_tags)))
+
+            params = selected_tags * 2  # 第一次用于JOIN条件，第二次用于排除已选标签
+            self.cursor.execute(query, params)
+            other_tags = self.cursor.fetchall()
+
+            # 合并标签列表：先显示已选中的标签（按选择顺序），然后是其他相关标签
+            all_tags = [(tag, selected_videos_count) for tag in selected_tags] + other_tags
+        else:
+            # 没有选中任何标签时，显示所有标签
+            self.cursor.execute('''
+            SELECT t.tag, COUNT(DISTINCT t.video_id) as video_count
+            FROM tags t
+            JOIN videos v ON t.video_id = v.id
+            WHERE v.is_deleted = 0
+            GROUP BY t.tag
+            ORDER BY video_count DESC, t.tag
+            ''')
+            all_tags = self.cursor.fetchall()
+
+        x, y = 10, 10
+        for tag, count in all_tags:
+            # 如果数量等于已选标签的视频数量且不是已选中的标签，则跳过（隐藏）
+            if selected_tags and tag not in selected_tags and count == selected_videos_count:
+                continue
+
+            btn = buttons.GenToggleButton(
+                self.tags_panel,
+                label=f"{tag} ({count})",
+                pos=(x, y),
+                size=TAG_BUTTON_SIZE
+            )
+            btn.SetBezelWidth(1)
+
+            if tag in selected_tags:
+                btn.SetToggle(True)
+                btn.SetBackgroundColour(wx.Colour(180, 230, 180))
+            else:
+                btn.SetBackgroundColour(wx.Colour(240, 240, 240))
+
+            btn.Bind(wx.EVT_BUTTON, lambda e, t=tag: self.on_tag_button_click(e, t))
+            self.tag_buttons[tag] = btn
+
+            x += TAG_BUTTON_SIZE[0] + 10
+            if x > TAG_BUTTONS_SIZE[0] - TAG_BUTTON_SIZE[0]:
+                x = 10
+                y += TAG_BUTTON_SIZE[1] + 10
+
+        self.tags_panel.SetVirtualSize((TAG_BUTTONS_SIZE[0], y + TAG_BUTTON_SIZE[1] + 10))
+
+    def on_tag_button_click(self, event, tag):
+        btn = self.tag_buttons[tag]
+
+        if btn.GetToggle():
+            # 添加到有序字典中，保持选择顺序
+            self.selected_tags[tag] = True
+            btn.SetBackgroundColour(wx.Colour(180, 230, 180))
+        else:
+            if tag in self.selected_tags:
+                del self.selected_tags[tag]
+            btn.SetBackgroundColour(wx.Colour(240, 240, 240))
+
+        btn.Refresh()
+        self.search_videos_by_tags()
+        self.refresh_tag_buttons()
+
+    def search_videos_by_tags(self):
+        if not self.selected_tags:
+            self.load_all_videos()
+            return
+
+        self.video_list.DeleteAllItems()
+
+        # 获取已选标签对应的视频ID和名称
+        query = '''
+        SELECT v.id, v.name
+        FROM videos v
+        WHERE v.is_deleted=0 AND EXISTS (
+            SELECT 1 FROM tags t
+            WHERE t.video_id = v.id AND t.tag = ?
+        )''' + (' AND EXISTS (SELECT 1 FROM tags t WHERE t.video_id = v.id AND t.tag = ?)' * (len(self.selected_tags)-1))
+
+        params = tuple(self.selected_tags.keys())
+
+        self.cursor.execute(query, params)
+        for video_id, name in self.cursor.fetchall():
+            index = self.video_list.InsertItem(self.video_list.GetItemCount(), name)
+            self.video_list.SetItemData(index, video_id)
+
+    def on_add_tag(self, event):
+        if self.current_video_id is None:
+            wx.MessageBox("请先选择文件", "错误", wx.OK|wx.ICON_ERROR)
+            return
+
+        tag = self.tag_input.GetValue().strip()
+        if not tag:
+            wx.MessageBox("请输入标签内容", "错误", wx.OK|wx.ICON_ERROR)
+            return
+
+        self.cursor.execute("SELECT id FROM tags WHERE video_id=? AND tag=?", (self.current_video_id, tag))
+        if self.cursor.fetchone():
+            wx.MessageBox("该标签已存在", "提示", wx.OK|wx.ICON_INFORMATION)
+            return
+
+        self.cursor.execute("INSERT INTO tags (video_id, tag) VALUES (?, ?)", (self.current_video_id, tag))
+        self.conn.commit()
+        self.tag_input.Clear()
+
+        self.refresh_current_video_tags(self.current_video_id)
+        self.refresh_tag_buttons()
+        self.tag_input.SetFocus()
+
+    def on_search_input_changed(self, event):
+        keyword = self.search_input.GetValue().lower()
+
+        for btn in self.tag_buttons.values():
+            btn.Hide()
+
+        x, y = 10, 10
+        for tag, btn in self.tag_buttons.items():
+            if keyword in tag.lower():
+                btn.SetPosition((x, y))
+                btn.Show()
+
+                x += TAG_BUTTON_SIZE[0] + 10
+                if x > TAG_BUTTONS_SIZE[0] - TAG_BUTTON_SIZE[0]:
+                    x = 10
+                    y += TAG_BUTTON_SIZE[1] + 10
+
+        self.tags_panel.SetVirtualSize((
+            TAG_BUTTONS_SIZE[0],
+            y + TAG_BUTTON_SIZE[1] + 10
+        ))
+        self.tags_panel.Layout()
+
+    def on_clear_search(self, event):
+        self.search_input.SetValue("")
+        self.selected_tags.clear()
+        self.refresh_tag_buttons()
+        self.load_all_videos()
+
+    def load_all_videos(self):
+        self.video_list.DeleteAllItems()
+        self.cursor.execute("SELECT id, name FROM videos WHERE is_deleted=0")
+        for video_id, name in self.cursor.fetchall():
+            index = self.video_list.InsertItem(self.video_list.GetItemCount(), name)
+            self.video_list.SetItemData(index, video_id)
+
+    def __del__(self):
+        if hasattr(self, 'conn'):
+            self.conn.close()
+
+if __name__ == "__main__":
+    app = wx.App()
+    try:
+        frame = VideoTagger()
+        app.MainLoop()
+    except Exception as e:
+        print(f"程序错误: {str(e)}")
+        sys.exit(1)
